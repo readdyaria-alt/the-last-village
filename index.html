@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Last Village</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#111;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{background:#3b6b34;max-width:100vw;max-height:100vh;cursor:crosshair;display:block}
+</style>
+</head>
+<body>
+<canvas id="c" width="960" height="640"></canvas>
+<script>
+"use strict";
+const W = 960, H = 640;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+
+// ---------- Tuning ----------
+const WIN_TIME = 600;
+const CORE_MAX = 150, CORE_X = W/2, CORE_Y = H/2, CORE_R = 36;
+const REPAIR_COST = 30, REPAIR_AMT = 25;
+const TOWER_BUILD = 50, TOWER_MAX = 5, TOWER_RANGE = 170;
+const FORGE_MAX = 8;
+const ENEMY = {
+  runner: {hp:20, speed:95, dmg:2,  gold:6,  r:9,  color:"#e8d44d", atkCd:0.8},
+  brute:  {hp:90, speed:45, dmg:12, gold:20, r:16, color:'#a33a3a', atkCd:1.2},
+};
+
+// ---------- State ----------
+let game;
+function newGame(){
+  game = {
+    state:'start', t:0, gold:20, shake:0, spawnTimer:3,
+    core:{hp:CORE_MAX},
+    player:{x:CORE_X, y:CORE_Y+90, r:11, speed:180, cd:0, flash:0},
+    forgeLv:0,
+    forge:{x:CORE_X-130, y:CORE_Y},
+    spots:[[-150,-110],[150,-110],[-150,110],[150,110]].map(o=>({x:CORE_X+o[0], y:CORE_Y+o[1], lv:0, cd:0, ang:0})),
+    enemies:[], bullets:[], coins:[], texts:[],
+  };
+}
+newGame();
+
+const keys = {};
+const mouse = {x:W/2, y:H/2, down:false};
+
+// ---------- Derived stats ----------
+const weaponDmg  = () => 10 + 4*Math.ceil(game.forgeLv/2);
+const weaponRate = () => 3 + 0.8*Math.floor(game.forgeLv/2);
+const towerDmg   = lv => 6 + 5*lv;
+const towerRate  = lv => 0.9 + 0.35*lv;
+const forgeCost  = () => Math.round(40*Math.pow(1.5, game.forgeLv));
+const towerCost  = s => s.lv===0 ? TOWER_BUILD : Math.round(TOWER_BUILD*Math.pow(1.6, s.lv));
+
+// ---------- Helpers ----------
+const dist = (a,b) => Math.hypot(a.x-b.x, a.y-b.y);
+function floatText(x,y,s,color){ game.texts.push({x,y,s,color,life:1}); }
+
+// ---------- Upgrades ----------
+function tryUpgradeAt(x,y){
+  const g = game, p = {x,y};
+  // core
+  if (dist(p,{x:CORE_X,y:CORE_Y}) < CORE_R+6){
+    if (g.core.hp >= CORE_MAX) floatText(CORE_X,CORE_Y-50,'Town is healthy','#fff');
+    else if (g.gold >= REPAIR_COST){ g.gold -= REPAIR_COST; g.core.hp = Math.min(CORE_MAX, g.core.hp+REPAIR_AMT); floatText(CORE_X,CORE_Y-50,'+Repair','#6f6'); }
+    else floatText(CORE_X,CORE_Y-50,'Need gold','#f66');
+    return true;
+  }
+  // forge
+  if (Math.abs(x-g.forge.x)<28 && Math.abs(y-g.forge.y)<24){
+    if (g.forgeLv >= FORGE_MAX) floatText(g.forge.x,g.forge.y-40,'MAX','#fff');
+    else if (g.gold >= forgeCost()){ g.gold -= forgeCost(); g.forgeLv++; floatText(g.forge.x,g.forge.y-40,'Weapon up!','#6f6'); }
+    else floatText(g.forge.x,g.forge.y-40,'Need gold','#f66');
+    return true;
+  }
+  // tower spots
+  for (const s of g.spots){
+    if (dist(p,s) < 24){
+      if (s.lv >= TOWER_MAX) floatText(s.x,s.y-40,'MAX','#fff');
+      else if (g.gold >= towerCost(s)){ g.gold -= towerCost(s); floatText(s.x,s.y-40, s.lv?'Upgraded!':'Built!','#6f6'); s.lv++; }
+      else floatText(s.x,s.y-40,'Need gold','#f66');
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------- Spawning ----------
+function spawnEnemy(){
+  const g = game, m = g.t/WIN_TIME;
+  const side = Math.floor(Math.random()*4);
+  let x,y;
+  if (side===0){x=Math.random()*W;y=-20;} else if(side===1){x=W+20;y=Math.random()*H;}
+  else if(side===2){x=Math.random()*W;y=H+20;} else {x=-20;y=Math.random()*H;}
+  const bruteChance = g.t<45 ? 0 : Math.min(0.5, 0.1+0.4*m);
+  const type = Math.random()<bruteChance ? 'brute':'runner';
+  const d = ENEMY[type], hp = d.hp*(1+1.5*m);
+  g.enemies.push({type,x,y,hp,max:hp,flash:0,atk:0,...d});
+}
+
+// ---------- Update ----------
+function update(dt){
+  const g = game;
+  if (g.state!=='play') return;
+  g.t += dt;
+  if (g.t >= WIN_TIME){ g.state='win'; return; }
+
+  // player
+  const p = g.player;
+  let dx=(keys.d?1:0)-(keys.a?1:0), dy=(keys.s?1:0)-(keys.w?1:0);
+  if (dx||dy){ const l=Math.hypot(dx,dy); p.x+=dx/l*p.speed*dt; p.y+=dy/l*p.speed*dt; }
+  p.x=Math.max(p.r,Math.min(W-p.r,p.x)); p.y=Math.max(p.r,Math.min(H-p.r,p.y));
+  p.cd -= dt; p.flash -= dt;
+  if (mouse.down && p.cd<=0 && !mouse.consumed){
+    p.cd = 1/weaponRate();
+    const a = Math.atan2(mouse.y-p.y, mouse.x-p.x);
+    g.bullets.push({x:p.x,y:p.y,vx:Math.cos(a)*620,vy:Math.sin(a)*620,dmg:weaponDmg(),life:0.9,own:'p'});
+  }
+
+  // spawner: interval 1.4s -> 0.35s, occasionally doubles
+  g.spawnTimer -= dt;
+  if (g.spawnTimer<=0){
+    const m = g.t/WIN_TIME;
+    g.spawnTimer = 1.4 - 1.05*m;
+    spawnEnemy();
+    if (m>0.3 && Math.random()<m*0.4) spawnEnemy();
+  }
+
+  // enemies
+  for (const e of g.enemies){
+    e.flash -= dt;
+    const dxc = CORE_X-e.x, dyc = CORE_Y-e.y, d = Math.hypot(dxc,dyc);
+    if (d > CORE_R + e.r){ e.x += dxc/d*e.speed*dt; e.y += dyc/d*e.speed*dt; }
+    else {
+      e.atk -= dt;
+      if (e.atk<=0){ e.atk=e.atkCd; g.core.hp -= e.dmg; g.shake=0.25; }
+    }
+  }
+  if (g.core.hp<=0){ g.core.hp=0; g.state='lose'; return; }
+
+  // towers
+  for (const s of g.spots){
+    if (!s.lv) continue;
+    s.cd -= dt;
+    let best=null, bd=TOWER_RANGE;
+    for (const e of g.enemies){ const d=dist(s,e); if (d<bd){bd=d;best=e;} }
+    if (best){
+      s.ang = Math.atan2(best.y-s.y,best.x-s.x);
+      if (s.cd<=0){
+        s.cd = 1/towerRate(s.lv);
+        g.bullets.push({x:s.x,y:s.y,vx:Math.cos(s.ang)*520,vy:Math.sin(s.ang)*520,dmg:towerDmg(s.lv),life:0.5,own:'t'});
+      }
+    }
+  }
+
+  // bullets
+  for (const b of g.bullets){
+    b.x+=b.vx*dt; b.y+=b.vy*dt; b.life-=dt;
+    for (const e of g.enemies){
+      if (e.hp>0 && Math.hypot(e.x-b.x,e.y-b.y) < e.r+4){
+        e.hp -= b.dmg; e.flash=0.08; b.life=0;
+        if (e.hp<=0){
+          const n = e.type==='brute'?4:2;
+          for (let i=0;i<n;i++) g.coins.push({x:e.x+(Math.random()-.5)*14,y:e.y+(Math.random()-.5)*14,v:e.gold/n,t:0});
+        }
+        break;
+      }
+    }
+  }
+  g.bullets = g.bullets.filter(b=>b.life>0 && b.x>-30&&b.x<W+30&&b.y>-30&&b.y<H+30);
+  g.enemies = g.enemies.filter(e=>e.hp>0);
+
+  // coins
+  for (const c of g.coins){
+    c.t += dt;
+    const d = dist(c,p);
+    if (d<110){ c.x+=(p.x-c.x)/d*260*dt; c.y+=(p.y-c.y)/d*260*dt; }
+    if (d<p.r+8){ g.gold += c.v; c.dead=true; floatText(p.x,p.y-16,'+'+Math.round(c.v),'#ffd54a'); }
+  }
+  g.coins = g.coins.filter(c=>!c.dead);
+
+  for (const t of g.texts){ t.life-=dt*1.2; t.y-=25*dt; }
+  g.texts = g.texts.filter(t=>t.life>0);
+  g.shake = Math.max(0,g.shake-dt);
+}
+
+// ---------- Drawing ----------
+function priceTag(x,y,label,cost,ok){
+  ctx.font='bold 13px sans-serif'; ctx.textAlign='center';
+  const text = label+(cost!=null?' '+cost+'g':'');
+  const w = ctx.measureText(text).width+14;
+  ctx.fillStyle='rgba(0,0,0,.7)'; ctx.fillRect(x-w/2,y-12,w,22);
+  ctx.fillStyle = ok?'#7dff7d':'#ff7d7d'; ctx.fillText(text,x,y+4);
+}
+function nearHover(o,r){ return dist(mouse,o)<r || dist(game.player,o)<r+30; }
+
+function draw(){
+  const g = game;
+  ctx.save();
+  if (g.shake>0) ctx.translate((Math.random()-.5)*6,(Math.random()-.5)*6);
+  ctx.clearRect(-10,-10,W+20,H+20);
+  // ground decoration
+  ctx.fillStyle='#437a3a';
+  for (let i=0;i<40;i++){ ctx.fillRect((i*137)%W,(i*263)%H,18,6); }
+  // path ring / town square
+  ctx.fillStyle='#8a7a5a'; ctx.beginPath(); ctx.arc(CORE_X,CORE_Y,230,0,7); ctx.fill();
+  ctx.fillStyle='#9c8c6a'; ctx.beginPath(); ctx.arc(CORE_X,CORE_Y,215,0,7); ctx.fill();
+
+  // core
+  ctx.fillStyle='#d9c9a0'; ctx.beginPath(); ctx.arc(CORE_X,CORE_Y,CORE_R,0,7); ctx.fill();
+  ctx.fillStyle='#b8452e'; ctx.beginPath(); ctx.moveTo(CORE_X-30,CORE_Y-6); ctx.lineTo(CORE_X,CORE_Y-34); ctx.lineTo(CORE_X+30,CORE_Y-6); ctx.fill();
+  ctx.fillStyle='#5b3a1e'; ctx.fillRect(CORE_X-7,CORE_Y+2,14,22);
+  ctx.fillStyle='#000'; ctx.fillRect(CORE_X-30,CORE_Y+44,60,7);
+  ctx.fillStyle=g.core.hp>35?'#4c4':'#e44'; ctx.fillRect(CORE_X-30,CORE_Y+44,60*g.core.hp/CORE_MAX,7);
+
+  // forge
+  const f = g.forge;
+  ctx.fillStyle='#555'; ctx.fillRect(f.x-26,f.y-20,52,40);
+  ctx.fillStyle='#333'; ctx.fillRect(f.x-20,f.y-12,40,10);
+  ctx.fillStyle='#ff8a2a'; ctx.fillRect(f.x-14,f.y+2,28,12);
+  ctx.fillStyle='#fff'; ctx.font='bold 11px sans-serif'; ctx.textAlign='center'; ctx.fillText('FORGE Lv'+g.forgeLv,f.x,f.y+34);
+
+  // tower spots
+  for (const s of g.spots){
+    if (!s.lv){
+      ctx.strokeStyle='#fff'; ctx.setLineDash([5,4]); ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(s.x,s.y,20,0,7); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle='#fff'; ctx.font='bold 22px sans-serif'; ctx.textAlign='center'; ctx.fillText('+',s.x,s.y+8);
+    } else {
+      ctx.fillStyle='#6b6b78'; ctx.beginPath(); ctx.arc(s.x,s.y,19,0,7); ctx.fill();
+      ctx.fillStyle='#4a4a58'; ctx.beginPath(); ctx.arc(s.x,s.y,12,0,7); ctx.fill();
+      ctx.strokeStyle='#ddd'; ctx.lineWidth=5; ctx.beginPath(); ctx.moveTo(s.x,s.y); ctx.lineTo(s.x+Math.cos(s.ang)*20,s.y+Math.sin(s.ang)*20); ctx.stroke();
+      ctx.fillStyle='#ffd54a'; ctx.font='bold 11px sans-serif'; ctx.textAlign='center'; ctx.fillText('Lv'+s.lv,s.x,s.y+34);
+    }
+  }
+
+  // coins
+  for (const c of g.coins){ ctx.fillStyle='#ffd54a'; ctx.beginPath(); ctx.arc(c.x,c.y,5,0,7); ctx.fill(); ctx.strokeStyle='#b8860b'; ctx.lineWidth=1.5; ctx.stroke(); }
+
+  // enemies
+  for (const e of g.enemies){
+    ctx.fillStyle = e.flash>0 ? '#fff' : e.color;
+    ctx.beginPath(); ctx.arc(e.x,e.y,e.r,0,7); ctx.fill();
+    ctx.strokeStyle='#000'; ctx.lineWidth=2; ctx.stroke();
+    if (e.hp<e.max){ ctx.fillStyle='#000'; ctx.fillRect(e.x-e.r,e.y-e.r-7,e.r*2,4); ctx.fillStyle='#e44'; ctx.fillRect(e.x-e.r,e.y-e.r-7,e.r*2*e.hp/e.max,4); }
+  }
+
+  // bullets
+  for (const b of g.bullets){ ctx.fillStyle = b.own==='p'?'#fff':'#9cf'; ctx.beginPath(); ctx.arc(b.x,b.y,b.own==='p'?3.5:3,0,7); ctx.fill(); }
+
+  // player
+  const p = g.player, a = Math.atan2(mouse.y-p.y,mouse.x-p.x);
+  ctx.fillStyle='#3a7bd5'; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,7); ctx.fill();
+  ctx.strokeStyle='#000'; ctx.lineWidth=2; ctx.stroke();
+  ctx.strokeStyle='#222'; ctx.lineWidth=5; ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x+Math.cos(a)*20,p.y+Math.sin(a)*20); ctx.stroke();
+
+  // price tags (hover / nearby)
+  if (g.state==='play'){
+    if (nearHover({x:CORE_X,y:CORE_Y},CORE_R+10)) priceTag(CORE_X,CORE_Y-52, g.core.hp>=CORE_MAX?'Town OK':'Repair', g.core.hp>=CORE_MAX?null:REPAIR_COST, g.core.hp<CORE_MAX&&g.gold>=REPAIR_COST);
+    if (nearHover(f,32)) priceTag(f.x,f.y-38, g.forgeLv>=FORGE_MAX?'Weapon MAX':(g.forgeLv%2?'Upgrade fire rate':'Upgrade damage'), g.forgeLv>=FORGE_MAX?null:forgeCost(), g.forgeLv<FORGE_MAX&&g.gold>=forgeCost());
+    for (const s of g.spots) if (nearHover(s,24)) priceTag(s.x,s.y-38, s.lv>=TOWER_MAX?'Tower MAX':(s.lv?'Upgrade tower':'Build tower'), s.lv>=TOWER_MAX?null:towerCost(s), s.lv<TOWER_MAX&&g.gold>=towerCost(s));
+  }
+
+  for (const t of g.texts){ ctx.globalAlpha=Math.max(0,t.life); ctx.fillStyle=t.color; ctx.font='bold 14px sans-serif'; ctx.textAlign='center'; ctx.fillText(t.s,t.x,t.y); ctx.globalAlpha=1; }
+  ctx.restore();
+
+  // HUD
+  ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(0,0,W,34);
+  ctx.font='bold 18px sans-serif'; ctx.textAlign='left'; ctx.fillStyle='#ffd54a'; ctx.fillText('Gold: '+Math.floor(g.gold),12,23);
+  ctx.textAlign='center'; ctx.fillStyle='#fff';
+  const left = Math.max(0,Math.ceil(WIN_TIME-g.t));
+  ctx.fillText('Survive  '+Math.floor(left/60)+':'+String(left%60).padStart(2,'0'),W/2,23);
+  ctx.textAlign='right'; ctx.fillStyle='#fff'; ctx.fillText('Town: '+Math.ceil(g.core.hp)+'/'+CORE_MAX,W-12,23);
+  if (g.state==='play' && g.t<25){
+    ctx.fillStyle='rgba(0,0,0,.6)'; ctx.fillRect(0,H-34,W,34);
+    ctx.fillStyle='#fff'; ctx.font='14px sans-serif'; ctx.textAlign='center';
+    ctx.fillText('WASD move  •  Mouse aim + click to shoot  •  Walk over coins  •  Click tower spots (+), the town, and the forge to spend gold',W/2,H-12);
+  }
+
+  if (g.state!=='play'){
+    ctx.fillStyle='rgba(0,0,0,.7)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#fff'; ctx.textAlign='center';
+    ctx.font='bold 54px sans-serif';
+    const title = g.state==='start'?'The Last Village':g.state==='win'?'You survived!':'The town has fallen';
+    ctx.fillText(title,W/2,H/2-60);
+    ctx.font='20px sans-serif';
+    const lines = g.state==='start'
+      ? ['Shoot enemies → collect gold → click town objects to upgrade.','Survive 10 minutes. Don\'t let the town core fall.','','Click to start']
+      : [g.state==='win'?'The village stands another day.':'You lasted '+Math.floor(g.t/60)+':'+String(Math.floor(g.t%60)).padStart(2,'0'),'','Click or press R to play again'];
+    lines.forEach((l,i)=>ctx.fillText(l,W/2,H/2+i*30));
+  }
+}
+
+// ---------- Loop ----------
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.05,(now-last)/1000); last = now;
+  update(dt); draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------- Input ----------
+function toWorld(e){
+  const r = cv.getBoundingClientRect();
+  return {x:(e.clientX-r.left)*W/r.width, y:(e.clientY-r.top)*H/r.height};
+}
+addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if ('wasd'.includes(k)&&k.length===1) keys[k]=true;
+  if (k==='r' && game.state!=='play' && game.state!=='start'){ newGame(); game.state='play'; }
+});
+addEventListener('keyup',e=>{ keys[e.key.toLowerCase()]=false; });
+addEventListener('blur',()=>{ for(const k in keys) keys[k]=false; mouse.down=false; });
+cv.addEventListener('mousemove',e=>{ const p=toWorld(e); mouse.x=p.x; mouse.y=p.y; });
+cv.addEventListener('mousedown',e=>{
+  if (e.button!==0) return;
+  const p=toWorld(e); mouse.x=p.x; mouse.y=p.y;
+  if (game.state!=='play'){ if (game.state!=='start') newGame(); game.state='play'; mouse.down=false; return; }
+  mouse.consumed = tryUpgradeAt(p.x,p.y);
+  mouse.down = true;
+});
+addEventListener('mouseup',()=>{ mouse.down=false; mouse.consumed=false; });
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+</script>
+</body>
+</html>
